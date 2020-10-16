@@ -2,6 +2,17 @@
 #include <xfsptr.h>
 #include <xfsspi.h>
 
+HPROVIDER g_hProvider = NULL;
+HSERVICE g_hService = NULL;
+
+DWORD WINAPI WFPOpenProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult);
+
+	SendMessage(hWindowReturn, WFS_OPEN_COMPLETE, 0, (LPARAM)lpParam);
+	return 0;
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //    NAME OF THE METHOD: WFPOpen
@@ -58,7 +69,51 @@
 // OU PODEMOS DEFINIR como __declspec (dllexport)
 HRESULT WINAPI WFPOpen(HSERVICE hService, LPSTR lpszLogicalName, HAPP hApp, LPSTR lpszAppID, DWORD dwTraceLevel, DWORD dwTimeOut, HWND hWnd, REQUESTID reqId, HPROVIDER hProvider, DWORD dwSPIVersionsRequired, LPWFSVERSION lpSPIVersion, DWORD dwSrvcVersionsRequired, LPWFSVERSION lpSrvcVersion)
 {
+	// check hWnd
+	WINDOWINFO callWindow;
+	callWindow.cbSize = sizeof(WINDOWINFO);
+	if (hWnd == NULL || (!GetWindowInfo(hWnd, &callWindow) && (GetLastError() == ERROR_INVALID_HANDLE)))
+	{
+		return WFS_ERR_INVALID_HWND;;
+	}
+
+	// check pointer
+	if (lpSPIVersion == NULL || lpSrvcVersion == NULL)
+	{
+		return WFS_ERR_INVALID_POINTER;
+	}
+
+	// check version XFS application send
+
+	// save hService and hProvider
+	g_hProvider = hProvider;
+	g_hService = hService;
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = (LPVOID)(hWnd);
+	lpWFSResult->hResult = WFS_SUCCESS;
+
+	HANDLE hOpenThread;
+	DWORD dwThreadId;
+	hOpenThread = CreateThread(NULL, 0, WFPOpenProcess, lpWFSResult, 0, &dwThreadId);
 	return WFS_SUCCESS;
+}
+
+DWORD WINAPI WFPCloseProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult);
+
+	SendMessage(hWindowReturn, WFS_CLOSE_COMPLETE, 0, (LPARAM)lpParam);
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -86,6 +141,35 @@ HRESULT WINAPI WFPOpen(HSERVICE hService, LPSTR lpszLogicalName, HAPP hApp, LPST
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPClose(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || hService != g_hService)
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	// Check if hService has pending commands to be executed and wait them
+
+
+	// check if LOCK and UNLOCK provider
+
+	// remove hService from list
+	g_hService = NULL;
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = (LPVOID)(hWnd);
+	lpWFSResult->hResult = WFS_SUCCESS;
+
+	HANDLE hCloseThread;
+	DWORD dwThreadId;
+	hCloseThread = CreateThread(NULL, 0, WFPCloseProcess, lpWFSResult, 0, &dwThreadId);
 
 	return WFS_SUCCESS;
 }
