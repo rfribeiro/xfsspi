@@ -1,9 +1,65 @@
 #include "pch.h"
-#include <xfsptr.h>
-#include <xfsspi.h>
+#include "SPIPrinter.h"
 
-HPROVIDER g_hProvider = NULL;
-HSERVICE g_hService = NULL;
+DWORD WINAPI WFPSendEvent(LPVOID lpParam)
+{
+	int i = 0;
+	while (true) {
+		if (!g_wfs_event.empty())
+		{
+			std::map<HWND, WFS_EVENTS>::iterator it;
+			for (it = g_wfs_event.begin(); it != g_wfs_event.end(); ++it)
+			{
+				if (((*it).second.dwEvent & SERVICE_EVENTS) == SERVICE_EVENTS
+					|| ((*it).second.dwEvent & USER_EVENTS) == USER_EVENTS
+					|| ((*it).second.dwEvent & SYSTEM_EVENTS) == SYSTEM_EVENTS
+					|| ((*it).second.dwEvent & EXECUTE_EVENTS) == EXECUTE_EVENTS)
+				{
+					if (i % 2 == 0)
+					{
+						LPWFSRESULT lpWFSResult;
+						// allocate WFSResult buffer
+						if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_ZEROINIT, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+						{
+							return WFS_ERR_INTERNAL_ERROR;
+						}
+						lpWFSResult->hResult = WFS_SERVICE_EVENT;
+						lpWFSResult->hService = (*it).second.hService;
+						lpWFSResult->RequestID = NULL;
+						lpWFSResult->u.dwEventID = WFS_SRVE_PTR_MEDIAINSERTED;
+						lpWFSResult->lpBuffer = NULL;
+
+						SendMessage((*it).first, WFS_SERVICE_EVENT, 0, (LPARAM)lpWFSResult);
+					}
+					else
+					{
+						LPWFSRESULT lpWFSResult;
+						// allocate WFSResult buffer
+						if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_ZEROINIT, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+						{
+							return WFS_ERR_INTERNAL_ERROR;
+						}
+						lpWFSResult->hResult = WFS_SERVICE_EVENT;
+						lpWFSResult->hService = (*it).second.hService;
+						lpWFSResult->RequestID = NULL;
+						lpWFSResult->u.dwEventID = WFS_USRE_PTR_LAMPTHRESHOLD;
+						lpWFSResult->lpBuffer = NULL;
+
+						WFMAllocateMore(sizeof(DWORD), lpWFSResult, &lpWFSResult->lpBuffer);
+						LPWORD lpwLampThreshold = (LPWORD)lpWFSResult->lpBuffer;
+						*lpwLampThreshold = WFS_PTR_LAMPFADING;
+
+						SendMessage((*it).first, WFS_USER_EVENT, 0, (LPARAM)lpWFSResult);
+					}
+
+				}
+			}
+		}
+		i++;
+		Sleep(10000L);
+	}
+	return 0;
+}
 
 DWORD WINAPI WFPOpenProcess(LPVOID lpParam)
 {
@@ -87,7 +143,7 @@ HRESULT WINAPI WFPOpen(HSERVICE hService, LPSTR lpszLogicalName, HAPP hApp, LPST
 
 	// save hService and hProvider
 	g_hProvider = hProvider;
-	g_hService = hService;
+	g_h_services[hService] = true;
 
 	// allocate WFSResult buffer
 	LPWFSRESULT lpWFSResult;
@@ -142,7 +198,7 @@ DWORD WINAPI WFPCloseProcess(LPVOID lpParam)
 HRESULT WINAPI WFPClose(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 {
 	// check hService
-	if (hService == NULL || hService != g_hService)
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
 	{
 		return WFS_ERR_INVALID_HSERVICE;
 	}
@@ -151,9 +207,13 @@ HRESULT WINAPI WFPClose(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 
 
 	// check if LOCK and UNLOCK provider
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+	g_lock_state = UNLOCKED;
+	g_lock_hservice = NULL;
+	ReleaseMutex(g_lock_mutex);
 
 	// remove hService from list
-	g_hService = NULL;
+	g_h_services.erase(hService);
 
 	// allocate WFSResult buffer
 	LPWFSRESULT lpWFSResult;
@@ -172,6 +232,23 @@ HRESULT WINAPI WFPClose(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 	hCloseThread = CreateThread(NULL, 0, WFPCloseProcess, lpWFSResult, 0, &dwThreadId);
 
 	return WFS_SUCCESS;
+}
+
+
+DWORD WINAPI WFPLockProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult);
+
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+
+	g_lock_state = LOCKED;
+	g_lock_hservice = lpWfsResult->hService;
+
+	ReleaseMutex(g_lock_mutex);
+
+	SendMessage(hWindowReturn, WFS_LOCK_COMPLETE, 0, (LPARAM)lpParam);
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -204,8 +281,57 @@ HRESULT WINAPI WFPClose(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPLock(HSERVICE hService, DWORD dwTimeOut, HWND hWnd, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	// check if device is already locked state
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+	
+	if (g_lock_state == LOCKED || g_lock_state == LOCK_PENDING)
+	{
+		ReleaseMutex(g_lock_mutex);
+		return WFS_ERR_LOCKED;
+	}
+
+	g_lock_state = LOCK_PENDING;
+
+	ReleaseMutex(g_lock_mutex);
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = (LPVOID)(hWnd);
+	lpWFSResult->hResult = WFS_SUCCESS;
+
+	HANDLE hCloseThread;
+	DWORD dwThreadId;
+	hCloseThread = CreateThread(NULL, 0, WFPLockProcess, lpWFSResult, 0, &dwThreadId);
 
 	return WFS_SUCCESS;
+}
+
+
+DWORD WINAPI WFPUnLockProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult);
+
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+	g_lock_state = UNLOCKED;
+	g_lock_hservice = NULL;
+	ReleaseMutex(g_lock_mutex);
+
+	SendMessage(hWindowReturn, WFS_UNLOCK_COMPLETE, 0, (LPARAM)lpParam);
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -234,10 +360,48 @@ HRESULT WINAPI WFPLock(HSERVICE hService, DWORD dwTimeOut, HWND hWnd, REQUESTID 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPUnlock(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+	if (g_lock_state == UNLOCKED)
+	{
+		ReleaseMutex(g_lock_mutex);
+		return WFS_ERR_LOCKED;
+	}
+	ReleaseMutex(g_lock_mutex);
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = (LPVOID)(hWnd);
+	lpWFSResult->hResult = WFS_SUCCESS;
+
+	HANDLE hCloseThread;
+	DWORD dwThreadId;
+	hCloseThread = CreateThread(NULL, 0, WFPUnLockProcess, lpWFSResult, 0, &dwThreadId);
 
 	return WFS_SUCCESS;
 }
 
+DWORD WINAPI WFPRegisterProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult->lpBuffer);
+	lpWfsResult->lpBuffer = NULL;
+
+	SendMessage(hWindowReturn, WFS_REGISTER_COMPLETE, 0, (LPARAM)lpWfsResult);
+	return 0;
+}
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //    NAME OF THE METHOD: WFPRegister
 //
@@ -270,8 +434,58 @@ HRESULT WINAPI WFPUnlock(HSERVICE hService, HWND hWnd, REQUESTID reqId)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPRegister(HSERVICE hService, DWORD dwEventClass, HWND hWndReg, HWND hWnd, REQUESTID reqId)
 {
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+		return WFS_ERR_INVALID_HSERVICE;
+
+	if ((dwEventClass & SERVICE_EVENTS) != SERVICE_EVENTS
+		&& (dwEventClass & USER_EVENTS) != USER_EVENTS
+		&& (dwEventClass & SYSTEM_EVENTS) != SYSTEM_EVENTS
+		&& (dwEventClass & EXECUTE_EVENTS) != EXECUTE_EVENTS)
+		return WFS_ERR_USER_ERROR;
+
+
+
+	if (g_wfs_event.find(hWndReg) != g_wfs_event.end())
+	{
+		// enable event bits
+		g_wfs_event[hWndReg].dwEvent |= dwEventClass;
+	}
+	else
+	{
+		WFS_EVENTS wfsEvent;
+		wfsEvent.hService = hService;
+		wfsEvent.dwEvent = dwEventClass;
+		g_wfs_event[hWndReg] = wfsEvent;
+	}
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = hWnd;
+	lpWFSResult->u.dwCommandCode = dwEventClass;
+
+	HANDLE hGetInfoThread;
+	DWORD dwThreadId;
+	hGetInfoThread = CreateThread(NULL, 0, WFPRegisterProcess, lpWFSResult, 0, &dwThreadId);
 
 	return WFS_SUCCESS;
+}
+
+
+DWORD WINAPI WFPDeRegisterProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult->lpBuffer);
+	lpWfsResult->lpBuffer = NULL;
+
+	SendMessage(hWindowReturn, WFS_DEREGISTER_COMPLETE, 0, (LPARAM)lpWfsResult);
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -305,7 +519,151 @@ HRESULT WINAPI WFPRegister(HSERVICE hService, DWORD dwEventClass, HWND hWndReg, 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPDeregister(HSERVICE hService, DWORD dwEventClass, HWND hWndReg, HWND hWnd, REQUESTID reqId)
 {
+	if (hWndReg == NULL) {
+		g_wfs_event.clear();
+	}
+	else if (g_wfs_event.find(hWndReg) != g_wfs_event.end())
+	{
+		// enable event bits
+		g_wfs_event[hWndReg].dwEvent &= (~dwEventClass);
+
+		if (g_wfs_event[hWndReg].dwEvent == 0)
+			g_wfs_event.erase(hWndReg);
+	}
+	else
+	{
+		return WFS_ERR_INVALID_HWNDREG;
+	}
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = hWnd;
+	lpWFSResult->u.dwCommandCode = dwEventClass;
+
+	HANDLE hGetInfoThread;
+	DWORD dwThreadId;
+	hGetInfoThread = CreateThread(NULL, 0, WFPDeRegisterProcess, lpWFSResult, 0, &dwThreadId);
 	return WFS_SUCCESS;
+}
+
+
+void ProcessGetInfoStatus(LPWFSRESULT wfs_result)
+{
+	HRESULT res = WFMAllocateMore(sizeof(WFSPTRSTATUS), wfs_result, &wfs_result->lpBuffer);
+	if (res != WFS_SUCCESS)
+	{
+		wfs_result->hResult = WFS_ERR_INTERNAL_ERROR;
+	}
+	else
+	{
+		LPWFSPTRSTATUS lpStatus = (LPWFSPTRSTATUS)wfs_result->lpBuffer;
+
+		// init data
+		lpStatus->fwDevice = WFS_PTR_DEVPOWEROFF;
+		lpStatus->fwMedia = WFS_PTR_MEDIAUNKNOWN;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYUPPER] = WFS_PTR_PAPERUNKNOWN;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYLOWER] = WFS_PTR_PAPERNOTSUPP;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYEXTERNAL] = WFS_PTR_PAPERNOTSUPP;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYAUX] = WFS_PTR_PAPERNOTSUPP;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYAUX2] = WFS_PTR_PAPERNOTSUPP;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYPARK] = WFS_PTR_PAPERNOTSUPP;
+		lpStatus->fwToner = WFS_PTR_TONERUNKNOWN;
+		lpStatus->fwInk = WFS_PTR_INKNOTSUPP;
+		lpStatus->fwLamp = WFS_PTR_LAMPNOTSUPP;
+		lpStatus->lppRetractBins = NULL;
+		lpStatus->usMediaOnStacker = 0;
+		lpStatus->lpszExtra = NULL;
+		std::fill_n(lpStatus->dwGuidLights, WFS_PTR_GUIDLIGHTS_SIZE, WFS_PTR_GUIDANCE_NOT_AVAILABLE);
+		lpStatus->wDevicePosition = WFS_PTR_DEVICEPOSNOTSUPP;
+		lpStatus->usPowerSaveRecoveryTime = 0;
+		std::fill_n(lpStatus->wPaperType, WFS_PTR_SUPPLYSIZE, WFS_PTR_PAPERTYPEUNKNOWN);
+		lpStatus->wPaperType[WFS_PTR_SUPPLYUPPER] = WFS_PTR_PAPERSINGLESIDED;
+		lpStatus->wAntiFraudModule = WFS_PTR_AFMNOTSUPP;
+		lpStatus->wBlackMarkMode = WFS_PTR_BLACKMARKDETECTIONNOTSUPP;
+
+		// get information from physical device
+
+		// fill the status on the structure
+		lpStatus->fwDevice = WFS_PTR_DEVONLINE;
+		lpStatus->fwPaper[WFS_PTR_SUPPLYUPPER] = WFS_PTR_PAPERFULL;
+	}
+}
+
+void ProcessGetInfoCapabilities(LPWFSRESULT wfs_result)
+{
+	HRESULT res = WFMAllocateMore(sizeof(WFSPTRCAPS), wfs_result, &wfs_result->lpBuffer);
+	if (res != WFS_SUCCESS)
+	{
+		wfs_result->hResult = WFS_ERR_INTERNAL_ERROR;
+	}
+	else
+	{
+		LPWFSPTRCAPS lpCaps = (LPWFSPTRCAPS)wfs_result->lpBuffer;
+
+		lpCaps->wClass = WFS_SERVICE_CLASS_PTR;
+		lpCaps->fwType = WFS_PTR_TYPERECEIPT;
+		lpCaps->bCompound = FALSE;
+		lpCaps->wResolution = WFS_PTR_RESMED;
+		lpCaps->fwReadForm = 0;
+		lpCaps->fwWriteForm = 0;
+		lpCaps->fwExtents = 0;
+		lpCaps->fwControl = 0;
+		lpCaps->usMaxMediaOnStacker = 0;
+		lpCaps->bAcceptMedia = FALSE;
+		lpCaps->bMultiPage = FALSE;
+		lpCaps->fwPaperSources = WFS_PTR_PAPERUPPER;
+		lpCaps->bMediaTaken = FALSE;
+		lpCaps->usRetractBins = 0;
+		lpCaps->lpusMaxRetract = NULL;
+		lpCaps->fwImageType = 0;
+		lpCaps->fwFrontImageColorFormat = 0;
+		lpCaps->fwBackImageColorFormat = 0;
+		lpCaps->fwCodelineFormat = 0;
+		lpCaps->fwImageSource = 0;
+		lpCaps->fwCharSupport = WFS_PTR_ASCII | WFS_PTR_UNICODE;
+		lpCaps->bDispensePaper = TRUE;
+		lpCaps->lpszExtra = NULL;
+		std::fill_n(lpCaps->dwGuidLights, WFS_PTR_GUIDLIGHTS_SIZE, WFS_PTR_GUIDANCE_NOT_AVAILABLE);
+		lpCaps->lpszWindowsPrinter = NULL;
+		lpCaps->bMediaPresented = FALSE;
+		lpCaps->usAutoRetractPeriod = 0;
+		lpCaps->bRetractToTransport = FALSE;
+		lpCaps->bPowerSaveControl = FALSE;
+		lpCaps->fwCoercivityType = WFS_PTR_COERCIVITYNOTSUPP;
+		lpCaps->fwControlPassbook = WFS_PTR_PBKCTRLNOTSUPP;
+		lpCaps->wPrintSides = WFS_PTR_PRINTSIDESSINGLE;
+		lpCaps->bAntiFraudModule = FALSE;
+		lpCaps->dwControlEx = WFS_PTR_CTRLEJECT | WFS_PTR_CTRLCUT;
+		lpCaps->bBlackMarkModeSupported = FALSE;
+		lpCaps->lpdwSynchronizableCommands = NULL;
+	}
+}
+
+DWORD WINAPI WFPGetInfoProcess(LPVOID lpParam)
+{
+	LPWFSRESULT lpWfsResult = (LPWFSRESULT)(lpParam);
+	HWND hWindowReturn = (HWND)(lpWfsResult->lpBuffer);
+
+	if (lpWfsResult->u.dwCommandCode == WFS_INF_PTR_CAPABILITIES)
+	{
+		ProcessGetInfoCapabilities(lpWfsResult);
+		lpWfsResult->hResult = WFS_SUCCESS;
+	}
+	else if (lpWfsResult->u.dwCommandCode == WFS_INF_PTR_STATUS)
+	{
+		ProcessGetInfoStatus(lpWfsResult);
+		lpWfsResult->hResult = WFS_SUCCESS;
+	}
+
+	SendMessage(hWindowReturn, WFS_GETINFO_COMPLETE, 0, (LPARAM)lpParam);
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -342,7 +700,130 @@ HRESULT WINAPI WFPDeregister(HSERVICE hService, DWORD dwEventClass, HWND hWndReg
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPGetInfo(HSERVICE hService, DWORD dwCategory, LPVOID lpQueryDetails, DWORD dwTimeOut, HWND hWnd, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE | WFS_MEM_ZEROINIT, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->lpBuffer = (LPVOID)(hWnd);
+	lpWFSResult->u.dwCommandCode = dwCategory;
+
+
+	HANDLE hCloseThread;
+	DWORD dwThreadId;
+	hCloseThread = CreateThread(NULL, 0, WFPGetInfoProcess, lpWFSResult, 0, &dwThreadId);
+
 	return WFS_SUCCESS;
+}
+
+
+void WFPExecutePrint(LPWFSRESULT wfs_result, LPVOID data)
+{
+	LPWFSPTRRAWDATA lpData = (LPWFSPTRRAWDATA)data;
+
+	wfs_result->hResult = WFS_SUCCESS;
+	wfs_result->lpBuffer = NULL;
+
+	if (lpData->lpbData != NULL)
+	{
+		free(lpData->lpbData);
+	}
+
+	if (lpData != NULL)
+	{
+		free(lpData);
+	}
+
+}
+
+void WFPExecuteControlMediaCommand(LPWFSRESULT wfs_result, LPVOID data)
+{
+	LPWORD lpMediaControl = (LPWORD)data;
+
+	wfs_result->hResult = WFS_SUCCESS;
+	wfs_result->lpBuffer = NULL;
+
+	if (lpMediaControl != NULL)
+	{
+		free(lpMediaControl);
+	}
+}
+
+DWORD WINAPI WFPExecuteProcess(LPVOID lpParam)
+{
+	WFS_MSG *msg = (WFS_MSG*)(lpParam);
+	LPWFSRESULT lpWfsResult = msg->lpWFSResult;
+	HWND hWindowReturn = (HWND)msg->hWnd;
+
+	if (lpWfsResult->u.dwCommandCode == WFS_CMD_PTR_RAW_DATA)
+	{
+		WFPExecutePrint(lpWfsResult, msg->lpDataReceived);
+	}
+	else if (lpWfsResult->u.dwCommandCode == WFS_CMD_PTR_CONTROL_MEDIA)
+	{
+		WFPExecuteControlMediaCommand(lpWfsResult, msg->lpDataReceived);
+	}
+	free(msg);
+
+	SendMessage(hWindowReturn, WFS_EXECUTE_COMPLETE, 0, (LPARAM)lpWfsResult);
+	return 0;
+}
+
+DWORD WINAPI WFPExecuteThread(LPVOID lpParam)
+{
+	while (TRUE)
+	{
+		// read data from queue
+		WaitForSingleObject(g_wfs_queue_mutex, INFINITE);
+		// check if queue is not empty
+		if (!g_wfs_msg_queue.empty())
+		{
+			// remove command from queue
+			WFS_MSG* msg = g_wfs_msg_queue.front();
+			LPWFSRESULT lpWfsResult = msg->lpWFSResult;
+			HWND hWindowReturn = (HWND)msg->hWnd;
+			g_wfs_msg_queue.pop_front();
+			ReleaseMutex(g_wfs_queue_mutex);
+
+			if (msg->bCancelled == TRUE)
+			{
+				// command is cancelled
+				msg->lpWFSResult->hResult = WFS_ERR_CANCELED;
+			}
+			else
+			{
+				if (lpWfsResult->u.dwCommandCode == WFS_CMD_PTR_RAW_DATA)
+				{
+					WFPExecutePrint(lpWfsResult, msg->lpDataReceived);
+				}
+				else if (lpWfsResult->u.dwCommandCode == WFS_CMD_PTR_CONTROL_MEDIA)
+				{
+					WFPExecuteControlMediaCommand(lpWfsResult, msg->lpDataReceived);
+				}
+			}
+			//post message to XFS Manager
+			SendMessage(hWindowReturn, WFS_EXECUTE_COMPLETE, NULL, (LPARAM)lpWfsResult);
+
+			free(msg);
+		}
+		else
+		{
+			ReleaseMutex(g_wfs_queue_mutex);
+		}
+		Sleep(10000L);
+	}
+
+	return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -377,6 +858,97 @@ HRESULT WINAPI WFPGetInfo(HSERVICE hService, DWORD dwCategory, LPVOID lpQueryDet
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPExecute(HSERVICE hService, DWORD dwCommand, LPVOID lpCmdData, DWORD dwTimeOut, HWND hWnd, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	// check lock state
+	WaitForSingleObject(g_lock_mutex, INFINITE);
+	if (g_lock_state == LOCKED && g_lock_hservice != hService)
+	{
+		ReleaseMutex(g_lock_mutex);
+		return WFS_ERR_LOCKED;
+	}
+	ReleaseMutex(g_lock_mutex);
+
+	// check supported commands
+	if (dwCommand == WFS_CMD_PTR_PRINT_FORM
+		|| dwCommand == WFS_CMD_PTR_READ_FORM
+		|| dwCommand == WFS_CMD_PTR_MEDIA_EXTENTS
+		|| dwCommand == WFS_CMD_PTR_RESET_COUNT
+		|| dwCommand == WFS_CMD_PTR_READ_IMAGE
+		|| dwCommand == WFS_CMD_PTR_RETRACT_MEDIA
+		|| dwCommand == WFS_CMD_PTR_SET_GUIDANCE_LIGHT
+		|| dwCommand == WFS_CMD_PTR_PRINT_RAW_FILE
+		|| dwCommand == WFS_CMD_PTR_LOAD_DEFINITION
+		|| dwCommand == WFS_CMD_PTR_SUPPLY_REPLENISH
+		|| dwCommand == WFS_CMD_PTR_POWER_SAVE_CONTROL
+		|| dwCommand == WFS_CMD_PTR_CONTROL_PASSBOOK
+		|| dwCommand == WFS_CMD_PTR_SET_BLACK_MARK_MODE
+		|| dwCommand == WFS_CMD_PTR_SYNCHRONIZE_COMMAND)
+	{
+		return WFS_ERR_UNSUPP_COMMAND;
+	}
+
+	// allocate WFSResult buffer
+	LPWFSRESULT lpWFSResult;
+	if (WFMAllocateBuffer(sizeof(WFSRESULT), WFS_MEM_SHARE, (LPVOID*)&lpWFSResult) != WFS_SUCCESS)
+	{
+		return WFS_ERR_INTERNAL_ERROR;
+	}
+
+	lpWFSResult->RequestID = reqId;
+	lpWFSResult->hService = hService;
+	lpWFSResult->u.dwCommandCode = dwCommand;
+
+
+	WFS_MSG* msgData = (WFS_MSG*)malloc(sizeof(WFS_MSG));
+	   
+	msgData->lpWFSResult = lpWFSResult;
+	msgData->hWnd = hWnd;
+	msgData->bCancelled = false;
+
+	if (dwCommand == WFS_CMD_PTR_RAW_DATA)
+	{
+		LPWFSPTRRAWDATA tmpCmdData = NULL;
+		LPBYTE tmpData = NULL;
+
+		// Allocate data for command
+		tmpCmdData = (LPWFSPTRRAWDATA)malloc(sizeof(WFSPTRRAWDATA));
+		if (tmpCmdData != NULL)
+		{
+			memcpy(tmpCmdData, lpCmdData, sizeof(WFSPTRRAWDATA));
+			if (tmpCmdData->ulSize > 0)
+			{
+				tmpData = (LPBYTE)malloc(tmpCmdData->ulSize);
+				memcpy(tmpData, ((LPWFSPTRRAWDATA)lpCmdData)->lpbData, tmpCmdData->ulSize);
+
+				((LPWFSPTRRAWDATA)tmpCmdData)->lpbData = tmpData;
+			}
+		}
+		msgData->lpDataReceived = tmpCmdData;
+	}
+	else if (dwCommand == WFS_CMD_PTR_CONTROL_MEDIA)
+	{
+		LPWORD tmpCmdData = (LPWORD)malloc(sizeof(WORD));
+		*tmpCmdData = *((LPWORD)lpCmdData);
+		msgData->lpDataReceived = (LPVOID)tmpCmdData;
+	}
+
+	DWORD dwThreadId;
+	//hExecuteThread = CreateThread(NULL, 0, WFPExecuteProcess, msgData, 0, &dwThreadId);
+	if (hExecuteThread == NULL) 
+	{
+		hExecuteThread = CreateThread(NULL, 0, WFPExecuteThread, 0, 0, &dwThreadId);
+	}
+
+	// Include message on dispatch queue
+	WaitForSingleObject(g_wfs_queue_mutex, INFINITE);
+	g_wfs_msg_queue.push_back(msgData);
+	ReleaseMutex(g_wfs_queue_mutex);
+
 	return WFS_SUCCESS;
 }
 
@@ -405,6 +977,25 @@ HRESULT WINAPI WFPExecute(HSERVICE hService, DWORD dwCommand, LPVOID lpCmdData, 
 //////////////////////////////////////////////////////////////////////////////
 HRESULT WINAPI WFPCancelAsyncRequest(HSERVICE hService, REQUESTID reqId)
 {
+	// check hService
+	if (hService == NULL || g_h_services.find(hService) == g_h_services.end())
+	{
+		return WFS_ERR_INVALID_HSERVICE;
+	}
+
+	WaitForSingleObject(g_wfs_queue_mutex, INFINITE);
+	std::deque<WFS_MSG*>::iterator it;
+	for (it = g_wfs_msg_queue.begin(); it != g_wfs_msg_queue.end(); ++it)
+	{
+		if ((*it)->lpWFSResult->hService == hService)
+		{
+			if ((reqId == NULL) || ((*it)->lpWFSResult->RequestID == reqId))
+			{
+				(*it)->bCancelled = true;
+			}
+		}
+	}
+	ReleaseMutex(g_wfs_queue_mutex);
 	return WFS_SUCCESS;
 }
 
